@@ -116,15 +116,37 @@ If bucket is empty → reject request (429).
 - Smooth average rate enforced.
 - **Best for:** APIs where short bursts are acceptable (most common use case).
 
+**Burst Capacity vs Refill Rate — Two Independent Knobs (Staff-Level):**
+```
+capacity     = max tokens the bucket can hold  →  controls burst ceiling
+refill_rate  = tokens added per second         →  controls sustained throughput
+
+Example: capacity=100, refill_rate=10/sec
+  → Client idle for 10 sec → bucket full (100 tokens)
+  → Client fires 100 requests in 1 sec → all allowed (burst)
+  → Then only 10 req/sec sustained going forward
+
+Tuning per use case:
+  Login endpoint:   capacity=5,  refill=1/sec   → small burst, tight sustained
+  Search endpoint:  capacity=50, refill=20/sec  → allows interaction bursts
+  Payment API:      capacity=3,  refill=0.1/sec → extreme tightness
+
+These are separate columns in rate_limit_rules table:
+  burst_size  INT  → capacity
+  refill_rate DECIMAL → tokens/sec
+```
+
 **Redis Implementation:**
 ```
 Key:   ratelimit:{clientId}:{endpoint}
 Fields: tokens (current count), last_refill (timestamp)
 
 Algorithm (Lua script — atomic):
+  local capacity    = tonumber(ARGV[1])  -- burst ceiling
+  local refill_rate = tonumber(ARGV[2])  -- tokens/sec
   now = current_time_ms
   elapsed = now - last_refill
-  tokens = min(capacity, tokens + elapsed × refill_rate)
+  tokens = min(capacity, tokens + (elapsed / 1000) × refill_rate)
   last_refill = now
   if tokens >= 1:
       tokens -= 1
@@ -277,11 +299,47 @@ CREATE TABLE rate_limit_rules (
 5. Global default rule
 ```
 
+**Multi-Level (Hierarchical) Rate Limiting — Hot Path Evaluation (Staff-Level):**
+```
+Problem: A single request may need to pass MULTIPLE rules simultaneously.
+All applicable rules must be checked — the most restrictive one wins.
+
+Example: User U123 (Enterprise tier) hits POST /payments
+  Rule 1: user:U123   → 100 req/min   (per-user limit)
+  Rule 2: enterprise  → 5000 req/min  (tier limit)
+  Rule 3: /payments   → 500 req/min   (endpoint global cap)
+  Rule 4: global      → 50K req/min   (system-wide cap)
+  → ALL four counters are checked and incremented in a single Lua script
+  → If ANY rule is exceeded → 429 (with which rule was breached in response)
+
+Lua script for multi-rule evaluation:
+  local results = {}
+  for i, key in ipairs(KEYS) do
+      local limit = tonumber(ARGV[i])
+      local count = redis.call('INCR', key)
+      if count == 1 then redis.call('EXPIRE', key, tonumber(ARGV[#ARGV])) end
+      if count > limit then
+          table.insert(results, key)  -- record which rule was breached
+      end
+  end
+  if #results > 0 then return results end  -- DENY + which rule
+  return {}                                 -- ALLOW
+
+Response on breach:
+  HTTP 429
+  X-RateLimit-Violated-Rule: "endpoint:/payments:global"
+  Retry-After: 47
+
+Performance: all N rule counters evaluated in 1 Lua round trip to Redis.
+             N is small (typically 3–5); no extra latency vs single-rule check.
+```
+
 ---
 
 ## 7. Distributed Rate Limiting Design
 
-**The challenge:** 10 Rate Limiter nodes each have their own memory. A client hitting different nodes could exceed the limit N× times.
+> [!WARNING]
+> **The challenge:** 10 Rate Limiter nodes each have their own memory. A client hitting different nodes could exceed the limit N× times.
 
 **Solution: Redis as centralized counter store**
 
@@ -317,6 +375,38 @@ end
 ```
 
 **Why Lua script?** Atomic execution on Redis — no race condition between COUNT and INCR.
+
+**Redis Cluster Shard Hotspot Problem (Staff-Level):**
+```
+Problem: A viral API key (e.g., a major enterprise client) generates 500K req/sec.
+         All their keys hash to the same Redis slot → single shard becomes the bottleneck.
+
+         Key: ratelimit:api:ACME_KEY:search
+         Redis slot = CRC16("api:ACME_KEY:search") % 16384 → always slot 4291
+         → All 500K req/sec hit shard owning slot 4291 → CPU saturation
+
+Solution A — Hash Tag control (preferred):
+  Force all keys for a client into the SAME slot intentionally (for multi-key Lua atomicity)
+  but distribute ACROSS clients using a client_shard suffix:
+
+  key = "ratelimit:{api:ACME_KEY:shard:3}:search"
+  Redis hash tag = content inside {} = "api:ACME_KEY:shard:3"
+  Shard suffix = hash(clientId) % NUM_SHARDS  (e.g., 0–7)
+  → Each client consistently maps to 1 of 8 Redis shards → load spread
+
+Solution B — Counter partitioning (for extreme traffic):
+  Instead of 1 counter key, maintain N replica counter keys per client:
+    ratelimit:api:ACME_KEY:search:p0  → shard A
+    ratelimit:api:ACME_KEY:search:p1  → shard B
+    ratelimit:api:ACME_KEY:search:p2  → shard C
+  Each node picks partition = hash(node_id) % N  → writes to that partition
+  Read path: SUM all N partitions to get real count
+  Trade-off: read is more expensive (N Redis calls); use for write-heavy hot clients only
+
+Decision:
+  Default: Solution A (hash tag shard affinity) — zero read overhead
+  Identified hot clients (>100K req/sec): Solution B (partitioned counters)
+```
 
 ---
 
@@ -394,6 +484,26 @@ For very high-traffic clients, maintain a **local approximate counter** in the s
 - Allows 10M+ req/sec without Redis bottleneck.
 - Trade-off: slight over-allowance during sync interval.
 
+**Overage Bound Analysis (Staff-Level):**
+```
+Max overage = nodes × rate_per_node × sync_interval
+
+Example: 10 nodes, limit=1000 req/min, sync every 100ms
+  Each node allows up to: 1000 × (100ms / 60000ms) ≈ 1.67 req per sync interval
+  10 nodes × 1.67 = ~17 extra requests per 100ms window  →  ~1.7% overage
+  → Acceptable if SLA says "<5% overage"; document this explicitly as product decision.
+
+Node crash during sync interval:
+  Unsynced local counts are LOST → Redis under-counts → slight under-enforcement
+  Mitigation: flush local counter to Redis before graceful shutdown (SIGTERM handler)
+  For ungraceful crash: accept loss; the overage is bounded by 1 sync interval's worth
+  → At 100ms sync, max lost count per node ≈ rate × 0.1 sec → negligible
+
+When NOT to use local cache:
+  → Strict financial/security endpoints (payment, auth) — always go direct to Redis
+  → Only apply to high-volume, tolerance-for-overage endpoints (search, listing)
+```
+
 ### 11.2 Redis Pipeline / Batch
 - Batch multiple client checks into a single Redis pipeline round trip.
 - Reduces network overhead from N round trips to 1.
@@ -464,7 +574,88 @@ Recommended: API Gateway for external traffic + Sidecar for inter-service limits
 
 ---
 
-## 16. Future Enhancements
+## 16. Thundering Herd on Window Reset
+
+```
+Problem:
+  At T=60s (window reset), ALL throttled clients receive Retry-After: 0
+  → They all retry simultaneously → 10,000 req spike in 1 sec → overwhelms upstream
+
+Example:
+  10,000 clients are throttled at 00:59.9
+  Window resets at 01:00.0
+  All 10,000 see Retry-After: 0 → instant thundering herd
+
+Solution 1 — Jittered Retry-After:
+  Instead of: Retry-After = window_end - now
+  Return:     Retry-After = (window_end - now) + random(0, jitter_sec)
+
+  jitter_sec = min(10, window_sec × 0.1)  → 10% of window size, max 10 sec
+  Effect: retries spread across [T+0, T+10s] → 10× reduction in spike height
+
+Solution 2 — Exponential Backoff guidance in response:
+  Retry-After: 5
+  X-RateLimit-Backoff-Multiplier: 2   ← hint to client to use exponential backoff
+  Well-behaved clients back off exponentially; spike naturally flattens
+
+Solution 3 — Token Bucket absorbs it naturally:
+  With Token Bucket, window reset is continuous (tokens refill smoothly)
+  No hard boundary → no thundering herd at all
+  → Another reason Token Bucket is preferred for external-facing APIs
+
+Recommendation:
+  Fixed / Sliding Window endpoints → always add jitter to Retry-After
+  Token Bucket endpoints → inherently immune, no jitter needed
+```
+
+---
+
+## 17. Shadow Mode & Safe Rule Rollout (Staff-Level)
+
+```
+Problem: Rolling out a new rate limit rule (e.g., /login: 5 req/min) incorrectly
+         can block all legitimate logins immediately → P0 incident.
+
+Phase 1 — Shadow Mode (observe-only):
+  Rate limiter evaluates rule but does NOT enforce it.
+  Logs: { rule: "login:5/min", client: U123, would_have_throttled: true }
+  Monitor for 24–48 hours:
+    → How many legitimate users would have been throttled?
+    → Is the limit too tight? Adjust before enforcement.
+  Implementation: rule has flag enforce=false in rule config table
+                  Lua script increments counter + checks limit but always returns ALLOW
+                  Emits shadow_429 metric instead of real 429
+
+Phase 2 — Gradual Enforcement (canary):
+  Enforce on X% of traffic, observe real 429 rate:
+    Day 1:  enforce on 1%  of clients → watch for complaints / error spike
+    Day 3:  enforce on 10% → validate at scale
+    Day 7:  enforce on 100% → full rollout
+  Canary key: hash(clientId) % 100 < canary_percent → enforce else skip
+
+Phase 3 — Headroom Start:
+  Start limit at 10× intended value, reduce weekly:
+    Week 1: limit = 500/min  (intended: 50/min)
+    Week 2: limit = 200/min
+    Week 3: limit = 100/min
+    Week 4: limit = 50/min  ← target
+  Gives clients time to adapt; no sudden disruption
+
+Rollback:
+  Rule config is in DB with enforce flag → instant rollback by flipping enforce=false
+  Propagates to all nodes within 60 sec (local cache TTL)
+  No deployment needed → safe and fast
+
+Dashboard signals to watch during rollout:
+  shadow_429_rate   → would-be throttle rate (Phase 1)
+  real_429_rate     → actual throttle rate (Phase 2+)
+  legitimate_retry_success_rate → are real users recovering after 429?
+  client_complaint_tickets      → leading indicator of over-aggressive limiting
+```
+
+---
+
+## 18. Future Enhancements
 - **Adaptive Rate Limiting** — dynamically adjust limits based on server load (auto-throttle during high CPU).
 - **Client Reputation Score** — penalize clients with history of abuse with lower limits.
 - **Geolocation-based limits** — different limits per region (GDPR, regional traffic control).
