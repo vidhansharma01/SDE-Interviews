@@ -332,6 +332,14 @@ Response on breach:
 
 Performance: all N rule counters evaluated in 1 Lua round trip to Redis.
              N is small (typically 3–5); no extra latency vs single-rule check.
+             
+Interview ready summary for multi-level rate limiter:-
+1.✅Match all applicable rules
+2.✅Evaluate in one atomic step
+3.✅Enforce minimum remaining capacity
+4.✅Use Redis + Lua
+5.✅Cache rules locally
+6.✅Support multiple dimensions (user/IP/endpoint)             
 ```
 
 ---
