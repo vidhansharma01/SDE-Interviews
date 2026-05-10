@@ -1,13 +1,13 @@
 ---
-name: High Level Design (HLD) for SDE 3 Interviews
-description: A comprehensive skill guide for tackling High Level Design interviews at the SDE 3 level. Covers frameworks, common system patterns, trade-off analysis, scalability strategies, and example walkthroughs for complex distributed systems.
+name: High Level Design (HLD) for Staff Software engineer Interviews
+description: A comprehensive skill guide for tackling High Level Design interviews at the Staff software engineer level. Covers frameworks, common system patterns, trade-off analysis, scalability strategies, and example walkthroughs for complex distributed systems.
 ---
 
-# High Level Design (HLD) for SDE 3 Interviews
+# High Level Design (HLD) for Staff software engineer Interviews
 
 ## Overview
 
-At the SDE 3 level, HLD interviews go beyond drawing boxes and arrows. You are expected to:
+At the Staff software engineer level, HLD interviews go beyond drawing boxes and arrows. You are expected to:
 - Lead the design conversation with **ownership and clarity**
 - Make **justified trade-offs** with awareness of cost, latency, consistency, and complexity
 - Reason about **scale** (millions of users, petabytes of data)
@@ -39,12 +39,12 @@ Always start by asking clarifying questions. Do not assume.
 ### Step 2 — Capacity Estimation (2–3 min)
 Back-of-envelope math demonstrates senior thinking.
 
-| Metric | Typical Estimation Approach |
-|---|---|
-| RPS | DAU × avg requests/day ÷ 86,400 |
-| Storage | records/day × avg record size × retention days |
-| Bandwidth | RPS × avg payload size |
-| Cache size | Hot data × hit ratio assumption |
+| Metric     | Typical Estimation Approach                    |
+| ---------- | ---------------------------------------------- |
+| RPS        | DAU × avg requests/day ÷ 86,400                |
+| Storage    | records/day × avg record size × retention days |
+| Bandwidth  | RPS × avg payload size                         |
+| Cache size | Hot data × hit ratio assumption                |
 
 **Example:** 100M DAU, each user sends 10 messages/day
 - Write RPS: 100M × 10 / 86,400 ≈ **~11,600 RPS**
@@ -77,7 +77,7 @@ Clients → CDN → API Gateway → Load Balancer
 Walk through each component's **responsibility**, **choice of technology**, and **why**.
 
 ### Step 5 — Deep Dive into Key Components (10–15 min)
-Pick 2–3 critical sub-systems and go deep. This is where SDE 3 differentiation happens.
+Pick 2–3 critical sub-systems and go deep. This is where Staff software engineer differentiation happens.
 
 Common deep-dive areas:
 - Database schema and indexing strategy
@@ -107,20 +107,20 @@ A distributed system can only guarantee **two** of:
 - **A**vailability — every request gets a response
 - **P**artition Tolerance — system continues despite network splits
 
-| System Type | Choice | Example |
-|---|---|---|
-| Financial ledger | CP | HBase, Zookeeper |
-| Social feed | AP | Cassandra, DynamoDB |
-| Search index | AP (eventual) | Elasticsearch |
+| System Type      | Choice        | Example             |
+| ---------------- | ------------- | ------------------- |
+| Financial ledger | CP            | HBase, Zookeeper    |
+| Social feed      | AP            | Cassandra, DynamoDB |
+| Search index     | AP (eventual) | Elasticsearch       |
 
 ### PACELC Extension
 Even without partition, there is a trade-off between **Latency** and **Consistency**.
 
 ### BASE vs ACID
-| ACID | BASE |
-|---|---|
-| Strong consistency | Eventual consistency |
-| Relational DBs | NoSQL / distributed DBs |
+| ACID                | BASE                           |
+| ------------------- | ------------------------------ |
+| Strong consistency  | Eventual consistency           |
+| Relational DBs      | NoSQL / distributed DBs        |
 | Rollback on failure | Accept temporary inconsistency |
 
 ---
@@ -134,11 +134,11 @@ Even without partition, there is a trade-off between **Latency** and **Consisten
 - **Health checks** are critical — remove unhealthy instances automatically
 
 ### 3.2 Caching
-| Layer | Tool | Use Case |
-|---|---|---|
-| CDN | Cloudfront, Fastly | Static assets, API responses |
-| App-level | Redis, Memcached | Session data, hot DB records |
-| DB query cache | Built-in (MySQL) | Repeated identical queries |
+| Layer          | Tool               | Use Case                     |
+| -------------- | ------------------ | ---------------------------- |
+| CDN            | Cloudfront, Fastly | Static assets, API responses |
+| App-level      | Redis, Memcached   | Session data, hot DB records |
+| DB query cache | Built-in (MySQL)   | Repeated identical queries   |
 
 **Eviction Policies:** LRU, LFU, TTL-based
 
@@ -154,12 +154,12 @@ Even without partition, there is a trade-off between **Latency** and **Consisten
 ### 3.3 Databases
 
 #### SQL vs NoSQL Decision Matrix
-| Criteria | Use SQL | Use NoSQL |
-|---|---|---|
-| Data structure | Structured, relational | Flexible, hierarchical |
-| Consistency need | Strong ACID | Eventual OK |
-| Query complexity | Complex joins | Simple key-based lookups |
-| Scale pattern | Vertical + read replicas | Horizontal sharding |
+| Criteria         | Use SQL                  | Use NoSQL                |
+| ---------------- | ------------------------ | ------------------------ |
+| Data structure   | Structured, relational   | Flexible, hierarchical   |
+| Consistency need | Strong ACID              | Eventual OK              |
+| Query complexity | Complex joins            | Simple key-based lookups |
+| Scale pattern    | Vertical + read replicas | Horizontal sharding      |
 
 #### Sharding Strategies
 - **Range-based:** Easy range queries but hotspot risk
@@ -173,12 +173,12 @@ Even without partition, there is a trade-off between **Latency** and **Consisten
 - **Leaderless (quorum):** Writes confirmed by N/2+1 nodes. Used in DynamoDB, Cassandra.
 
 ### 3.4 Message Queues & Event Streaming
-| Technology | Model | Best For |
-|---|---|---|
-| Kafka | Log-based, topic partitions | High-throughput, replay, event sourcing |
-| RabbitMQ | Queue with routing | Task queues, RPC patterns |
-| SQS (AWS) | Managed queue | Simple decoupling, serverless |
-| Pub/Sub (GCP) | Fan-out messaging | Notification systems |
+| Technology    | Model                       | Best For                                |
+| ------------- | --------------------------- | --------------------------------------- |
+| Kafka         | Log-based, topic partitions | High-throughput, replay, event sourcing |
+| RabbitMQ      | Queue with routing          | Task queues, RPC patterns               |
+| SQS (AWS)     | Managed queue               | Simple decoupling, serverless           |
+| Pub/Sub (GCP) | Fan-out messaging           | Notification systems                    |
 
 **Kafka Key Concepts:**
 - **Topic** → logical stream; split into **partitions**
@@ -215,12 +215,12 @@ Probabilistic data structure — fast membership test with no false negatives (m
 ## 4. Scalability Patterns
 
 ### Horizontal vs. Vertical Scaling
-| | Horizontal | Vertical |
-|---|---|---|
-| Method | Add more machines | Upgrade existing machine |
-| Limit | Network + coordination overhead | Hardware ceiling |
-| Cost | Commodity hardware | Expensive |
-| Preferred for | Stateless services | Stateful legacy systems |
+|               | Horizontal                      | Vertical                 |
+| ------------- | ------------------------------- | ------------------------ |
+| Method        | Add more machines               | Upgrade existing machine |
+| Limit         | Network + coordination overhead | Hardware ceiling         |
+| Cost          | Commodity hardware              | Expensive                |
+| Preferred for | Stateless services              | Stateful legacy systems  |
 
 ### Read-Heavy Systems
 - Add **read replicas** for DB
@@ -251,14 +251,14 @@ Problem: One entity (user, key) gets disproportionate traffic.
 - Data corruption — checksums, WAL (write-ahead log)
 
 ### Resilience Patterns
-| Pattern | Purpose | Example |
-|---|---|---|
-| Circuit Breaker | Stop calling a failing dependency | Netflix Hystrix |
-| Retry with Backoff | Retry transient failures | Exponential backoff + jitter |
-| Bulkhead | Isolate resources per service | Separate thread pools |
-| Timeout | Fail fast on slow dependencies | gRPC deadlines |
-| Idempotency | Safe to retry writes | Idempotency keys on POST |
-| Saga Pattern | Distributed transaction management | Choreography or orchestration |
+| Pattern            | Purpose                            | Example                       |
+| ------------------ | ---------------------------------- | ----------------------------- |
+| Circuit Breaker    | Stop calling a failing dependency  | Netflix Hystrix               |
+| Retry with Backoff | Retry transient failures           | Exponential backoff + jitter  |
+| Bulkhead           | Isolate resources per service      | Separate thread pools         |
+| Timeout            | Fail fast on slow dependencies     | gRPC deadlines                |
+| Idempotency        | Safe to retry writes               | Idempotency keys on POST      |
+| Saga Pattern       | Distributed transaction management | Choreography or orchestration |
 
 ### Data Durability
 - **WAL (Write-Ahead Log):** Changes written to log before applying; enables crash recovery
@@ -295,11 +295,11 @@ Problem: One entity (user, key) gets disproportionate traffic.
 
 ### 6.3 News Feed / Timeline (e.g., Twitter, Instagram)
 **Two Approaches:**
-| | Push (Fanout on Write) | Pull (Fanout on Read) |
-|---|---|---|
-| Write | Pre-compute feed at write time | Store only in author's timeline |
-| Read | Fast — feed already computed | Slower — merge N timelines |
-| Best for | Typical users (<1K followers) | Celebrity accounts (millions of followers) |
+|          | Push (Fanout on Write)         | Pull (Fanout on Read)                      |
+| -------- | ------------------------------ | ------------------------------------------ |
+| Write    | Pre-compute feed at write time | Store only in author's timeline            |
+| Read     | Fast — feed already computed   | Slower — merge N timelines                 |
+| Best for | Typical users (<1K followers)  | Celebrity accounts (millions of followers) |
 
 **Hybrid:** Use push for normal users, pull for celebrities. LinkedIn / Facebook use this.
 
@@ -344,13 +344,13 @@ Problem: One entity (user, key) gets disproportionate traffic.
 
 ### 6.7 Rate Limiter
 **Algorithms:**
-| Algorithm | Description | Pros/Cons |
-|---|---|---|
-| Token Bucket | Refill tokens at fixed rate; consume per request | Smooth, allows burst |
-| Leaky Bucket | Queue requests; drain at fixed rate | No burst, predictable output |
-| Fixed Window | Count requests per time window | Simple; boundary burst problem |
-| Sliding Window Log | Log each request timestamp; count in window | Accurate; memory intensive |
-| Sliding Window Counter | Weighted hybrid of adjacent fixed windows | Balanced accuracy + memory |
+| Algorithm              | Description                                      | Pros/Cons                      |
+| ---------------------- | ------------------------------------------------ | ------------------------------ |
+| Token Bucket           | Refill tokens at fixed rate; consume per request | Smooth, allows burst           |
+| Leaky Bucket           | Queue requests; drain at fixed rate              | No burst, predictable output   |
+| Fixed Window           | Count requests per time window                   | Simple; boundary burst problem |
+| Sliding Window Log     | Log each request timestamp; count in window      | Accurate; memory intensive     |
+| Sliding Window Counter | Weighted hybrid of adjacent fixed windows        | Balanced accuracy + memory     |
 
 **Distributed Rate Limiting:** Use Redis with Lua scripts for atomic counter update + TTL.
 
@@ -439,16 +439,16 @@ A system without observability is a black box. Always address this.
 
 Always raise security proactively in interviews.
 
-| Concern | Mitigation |
-|---|---|
-| Authentication | OAuth 2.0 / JWT; rotate secrets |
-| Authorization | RBAC or ABAC; least privilege |
-| Data in transit | TLS everywhere (mTLS for internal) |
-| Data at rest | AES-256 encryption; KMS for key management |
-| SQL Injection | Parameterised queries / ORM |
-| Rate limiting | Protect APIs from abuse |
-| DDoS | WAF + CDN absorbs volumetric attacks |
-| PII / GDPR | Data masking, retention policies, right to erasure |
+| Concern         | Mitigation                                         |
+| --------------- | -------------------------------------------------- |
+| Authentication  | OAuth 2.0 / JWT; rotate secrets                    |
+| Authorization   | RBAC or ABAC; least privilege                      |
+| Data in transit | TLS everywhere (mTLS for internal)                 |
+| Data at rest    | AES-256 encryption; KMS for key management         |
+| SQL Injection   | Parameterised queries / ORM                        |
+| Rate limiting   | Protect APIs from abuse                            |
+| DDoS            | WAF + CDN absorbs volumetric attacks               |
+| PII / GDPR      | Data masking, retention policies, right to erasure |
 
 ---
 
@@ -456,16 +456,16 @@ Always raise security proactively in interviews.
 
 Use this to structure your trade-off analysis:
 
-| Decision | Option A | Option B | When to choose A |
-|---|---|---|---|
-| DB type | SQL (Postgres) | NoSQL (Cassandra) | Relational data, complex queries |
-| Messaging | Kafka | RabbitMQ | High throughput, event replay needed |
-| Caching | Write-through | Write-behind | Consistency > performance |
-| API | REST | gRPC | Internal microservices needing performance |
-| Consistency | Strong | Eventual | Financial / inventory data |
-| Search | Elasticsearch | DB full-text | Large corpus, faceted search |
-| File storage | S3 | HDFS | Cloud-native, infrequent access |
-| Fan-out | Push | Pull | Low follower count users |
+| Decision     | Option A       | Option B          | When to choose A                           |
+| ------------ | -------------- | ----------------- | ------------------------------------------ |
+| DB type      | SQL (Postgres) | NoSQL (Cassandra) | Relational data, complex queries           |
+| Messaging    | Kafka          | RabbitMQ          | High throughput, event replay needed       |
+| Caching      | Write-through  | Write-behind      | Consistency > performance                  |
+| API          | REST           | gRPC              | Internal microservices needing performance |
+| Consistency  | Strong         | Eventual          | Financial / inventory data                 |
+| Search       | Elasticsearch  | DB full-text      | Large corpus, faceted search               |
+| File storage | S3             | HDFS              | Cloud-native, infrequent access            |
+| Fan-out      | Push           | Pull              | Low follower count users                   |
 
 ---
 
@@ -486,13 +486,13 @@ Use this to structure your trade-off analysis:
 
 ## 12. Evaluation Rubric at SDE 3 Level
 
-| Dimension | What Interviewers Look For |
-|---|---|
-| Problem Scoping | Asks right questions; defines clear boundaries |
-| Architecture | Clean, modular design with correct component choices |
-| Scalability | Quantified estimates; identifies bottlenecks; horizontal scaling |
-| Deep Dive | Technical depth in key components; not surface-level |
-| Trade-offs | Proactively discusses alternatives; justifies choices |
-| Reliability | Identifies failure modes; proposes mitigation |
-| Communication | Structured, clear; leads the conversation |
-| Adaptability | Responds well to follow-up challenges and pivots |
+| Dimension       | What Interviewers Look For                                       |
+| --------------- | ---------------------------------------------------------------- |
+| Problem Scoping | Asks right questions; defines clear boundaries                   |
+| Architecture    | Clean, modular design with correct component choices             |
+| Scalability     | Quantified estimates; identifies bottlenecks; horizontal scaling |
+| Deep Dive       | Technical depth in key components; not surface-level             |
+| Trade-offs      | Proactively discusses alternatives; justifies choices            |
+| Reliability     | Identifies failure modes; proposes mitigation                    |
+| Communication   | Structured, clear; leads the conversation                        |
+| Adaptability    | Responds well to follow-up challenges and pivots                 |

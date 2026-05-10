@@ -167,6 +167,43 @@ Total Pipeline Time: ~3–5 min for 8-min HD video
 - Transcoding is CPU-bound; different resolutions processed simultaneously.
 - 4K takes ~10 min per video; 360p takes 30 sec — don't let 4K block 360p.
 
+### 4.3 Transcoding Worker Scaling (Staff-Level)
+
+```
+Challenge: 500 hours uploaded/min × ~5 GPU-minutes/video = 150,000 GPU-minutes/min at peak
+
+Worker Fleet Architecture:
+  Priority Queue (SQS FIFO with 3 tiers):
+    P0 — Live stream ingest     (real-time SLA: <2 sec chunk delay)
+    P1 — Premium/Partner creators (SLA: <2 min to first playable resolution)
+    P2 — Standard creators       (SLA: <5 min; best-effort)
+
+Auto-Scaling Policy:
+  Metric:  SQS ApproximateNumberOfMessages per tier
+  Scale-out: +50 GPU workers when P1 queue depth > 200 messages
+  Scale-in:  -10 workers every 5 min when queue < 20 messages
+  Min fleet: 500 workers (always-on On-Demand) — handles baseline load
+  Burst fleet: up to 10,000 Spot instances (g4dn.xlarge for H.264, g5 for AV1)
+
+Cost control:
+  On-Demand instances: P0 + P1 only (SLA-critical)
+  Spot instances: P2 standard uploads — ~70% cost saving
+  Spot interruption handling:
+    Each resolution is an independent idempotent task → save progress per segment
+    If Spot interrupted, re-queue only incomplete segments (not full video)
+
+Worker checkpointing:
+  Worker writes: s3://yt-processing/{videoId}/progress.json
+    { "completedSegments": [0,1,2,..N], "resolution": "720p", "workerId": "w-abc" }
+  On re-assignment: new worker skips already-written segments → idempotent
+
+Early playback (progressive availability):
+  360p finishes in ~30 sec → video status = PARTIALLY_AVAILABLE
+  Creator and viewers can watch at 360p immediately
+  Higher resolutions published as they complete
+  Prevents 5-min wait for full 4K processing
+```
+
 ---
 
 ## 5. Adaptive Bitrate Streaming (ABR)
@@ -230,6 +267,37 @@ Seek optimization:
   User skips to 5:30 → client fetches segment containing 5:30
   Pre-buffers next 3 segments from that point
   No need to re-download earlier segments
+```
+
+### 5.4 CDN Invalidation & Video Takedown (Staff-Level)
+
+```
+Problem: Video deleted/taken-down, but CDN edges still serve cached .ts segments.
+         Naive approach (wait for TTL) = 24-hr window where banned content is accessible.
+
+Solution: Signed URL tokens + CDN purge API
+
+Signed URL approach (preferred at scale):
+  Every CDN URL includes a signed token:
+    https://cdn.yt.com/{videoId}/720p/seg_0.ts?token=<HMAC>&expires=<ts>&policy=<base64>
+  Token signed by Video Service → verified at CDN edge (Lambda@Edge / Akamai EdgeAuth)
+  On takedown:
+    1. Set video status = REMOVED in DB (< 100 ms)
+    2. Revoke signing key for this videoId in token auth service
+    3. All new segment requests → 403 Forbidden (token invalid)
+    4. No CDN purge needed — existing cached bytes are now unservable
+
+CDN Purge API (fallback for non-signed assets like thumbnails):
+  Bulk purge: DELETE /cdn/invalidate { paths: ['/thumb/{videoId}/*'] }
+  CloudFront: CreateInvalidation API — propagates to all PoPs in ~1-2 min
+  Akamai: Fast Purge API — ~5 sec global propagation
+  SLA for takedown: <2 min end-to-end (DB update + key revocation + purge)
+
+Segment TTL strategy:
+  Normal video segments:  TTL = 24 hr (high cache efficiency)
+  Recently uploaded:      TTL = 5 min (creator may still edit metadata)
+  Live stream chunks:     TTL = 2 sec (freshness requirement)
+  Manifests (m3u8):       TTL = 30 sec (dynamic; resolution availability changes)
 ```
 
 ---
@@ -373,6 +441,38 @@ User embedding = avg(embeddings of last 50 watched videos)
 → Enables fast ANN lookup for candidate generation
 ```
 
+**ANN Infrastructure (Staff-Level):**
+```
+Vector index (candidate generation at scale):
+  Library:  Google ScaNN (YouTube uses internally) or FAISS (open-source)
+  Index:    ~50M video embeddings (256-dim float32) ≈ 50M × 256 × 4 bytes ≈ 51 GB
+  Sharding: Index sharded across 20 servers; each handles a partition of video space
+  Query:    User embedding broadcast to all shards → top-K per shard → merge → top-1000
+  Latency:  <10 ms for candidate generation at P99
+
+Embedding freshness:
+  Video embeddings:  Recomputed nightly (Spark batch) for all active videos
+  User embeddings:   Two layers:
+    a) Long-term:   Spark batch daily — full watch history, stable preferences
+    b) Session:     Flink real-time — updates every 3 videos watched in current session
+                    Weighted: session_embedding × 0.6 + long_term × 0.4
+  Effect: User who just watched 3 cooking videos → session shifts toward food content
+
+Cold Start Problem:
+  New User (0 watch history):
+    Phase 1 (0-3 videos): Show "Trending" + "Top in category" (geography-based)
+    Phase 2 (3-10 videos): Collaborative filtering on interest categories
+                           (selected at signup or inferred from first watches)
+    Phase 3 (10+ videos):  Full DNN pipeline kicks in
+
+  New Video (just published):
+    No engagement signals yet → use content-based embedding only
+    Serve to small cohort matching content embedding → collect early CTR + watch %
+    After 1,000 views: engagement signals incorporated into ranking score
+    After 10,000 views: full ranking pipeline (CTR × watch_duration objective)
+    "Exploration traffic": 5% of impressions reserved for new/unproven videos
+```
+
 ### 6.5 Watch History & Resume Playback
 
 ```
@@ -411,6 +511,46 @@ Super Chats (paid messages):
   → Payment flow → prioritized pinned display in chat
 ```
 
+**Live Streaming Resilience (Staff-Level):**
+```
+Ingest Server Failover:
+  Creator's OBS pushes RTMP to primary ingest server
+  Ingest servers maintain heartbeat to health coordinator
+  If primary ingest fails:
+    DNS TTL = 5 sec on ingest endpoint → quick failover
+    OBS client auto-reconnects to same URL → load balancer routes to healthy ingest
+    Viewer-side: HLS player retries last successful segment timestamp
+    Gap in chunks: player stalls for max 10 sec → shows "Reconnecting..."
+    Segments resume from where ingest server left off (no rewind)
+
+DVR / Replay Buffer:
+  All live HLS chunks retained in S3 for 12 hours after stream ends
+  Viewer can seek back up to 4 hours in "live" mode (configurable)
+  VOD replay: after stream ends, manifest recombined into full-length VOD
+  Processing pipeline runs async to generate standard multi-res VOD version
+
+Low-Latency Live Streaming (LL-HLS):
+  Standard HLS: 6–30 sec latency (3 × 10-sec segments in buffer)
+  LL-HLS (HTTP/2 Push):  2–3 sec latency
+    Segments: 0.5–2 sec instead of 10 sec
+    Server push: CDN pushes next partial segment before client requests it
+    Use case: live sports, live events where latency matters
+  Trade-off: 5× more CDN requests per viewer-minute; higher edge compute cost
+  Decision: LL-HLS opt-in for creators; standard HLS default
+
+Live Chat Fan-out at Scale (100K concurrent viewers):
+  Naive: Fan out each message to 100K WebSocket connections → O(N) per message
+  Solution: Tiered fan-out
+    Chat Server writes message → Kafka topic: livechat:{videoId}
+    Kafka partitioned by videoId → N consumers, each owning a subset of WS connections
+    Each consumer responsible for ~5,000 connections → 20 consumer instances at 100K scale
+    Redis PubSub used within a consumer node for in-process fan-out
+  Spam control:
+    Slow mode: host-configurable delay between messages per user (0–300 sec)
+    Profanity filter: pre-publish regex + ML classifier (<5 ms, P99)
+    Rate limit: 1 msg/3 sec per user enforced at chat service (Redis token bucket)
+```
+
 ---
 
 ## 7. Content Moderation Pipeline
@@ -432,6 +572,53 @@ On video upload:
 
   4. Community guidelines violations:
      Post-publish: user reports → human review → strike / removal
+```
+
+**Content ID / Copyright Fingerprinting Deep Dive (Staff-Level):**
+```
+Challenge: Detect if uploaded video contains copyrighted audio or video
+           even if re-encoded, pitch-shifted, sped-up, or partially clipped.
+
+Audio Fingerprinting:
+  Algorithm: Chromaprint (used by AcoustID) or Shazam-style hashing
+  Process:
+    1. Extract MFCC (Mel-Frequency Cepstral Coefficients) from audio stream
+    2. Generate 32-bit fingerprint hash per 0.5-sec window → sequence of hashes
+    3. Compare against Content ID DB (billions of fingerprint sequences)
+    4. Match = sliding window comparison: 30+ consecutive matching hashes → flag
+  Robustness: survives 10% speed change, re-encoding, minor pitch shifts
+
+Video Fingerprinting:
+  Algorithm: Perceptual hashing (pHash) on keyframes
+  Process:
+    1. Extract 1 keyframe/sec → resize to 32×32 grayscale
+    2. DCT (Discrete Cosine Transform) → take top-left 8×8 coefficients
+    3. 64-bit pHash per frame
+    4. Compare Hamming distance against reference pHash sequences
+    5. Match: Hamming distance < 10 bits across 30 consecutive frames
+  Survives: re-encoding, mild crop, letterboxing, color grading
+  Does NOT survive: heavy cropping, mirroring + speed change combo
+
+Content ID DB Scale:
+  Rights-holders upload reference tracks → fingerprints pre-computed + stored
+  Storage: ~50B fingerprint hashes (audio + video combined) ≈ few TB (compact index)
+  Lookup: LSH (Locality Sensitive Hashing) for approximate nearest-neighbor match
+  Latency SLA: full fingerprint scan < 60 sec per uploaded video
+
+Policy Engine:
+  Rights-holder sets policy per asset:
+    BLOCK      → video removed immediately
+    MONETIZE   → ads run; revenue split to rights-holder
+    TRACK      → video stays, rights-holder gets view analytics only
+  Multiple claimants: most restrictive policy wins
+
+Timeline:
+  T+0:   Upload complete → video status = PROCESSING
+  T+30s: 360p available → PARTIALLY_AVAILABLE (before Content ID scan)
+  T+60s: Content ID scan complete → if BLOCK → take down; else continue
+  T+5min: Full pipeline done → PUBLISHED
+  Note: video is publicly accessible during 30–60 sec window before Content ID
+        → accepted trade-off for user experience ("video ready fast")
 ```
 
 ---
@@ -503,7 +690,143 @@ CDN PoP strategy:
 
 ---
 
-## 12. Future Enhancements
+## 12. Database Sharding Strategy (Staff-Level)
+
+```
+Problem: videos table with billions of rows cannot fit on a single PostgreSQL instance.
+
+Sharding Key Choice:
+  Option A: Shard by video_id (hash-based)
+    Pros: Uniform distribution; hot video not on same shard
+    Cons: Channel's videos spread across shards → listing all videos per channel = scatter-gather
+
+  Option B: Shard by channel_id (hash-based)
+    Pros: All videos for a channel on one shard → fast channel page queries
+    Cons: Viral channels (MrBeast: 300M subscribers) → hot shard problem
+
+  Decision: Shard by video_id (hash mod N)
+    Channel page uses a separate channel_videos index service (Elasticsearch or Cassandra)
+    Hot shard risk is eliminated (video_id uniform distribution)
+
+Sharding Architecture:
+  16 logical shards → mapped to 4 physical shard groups (4 shards per Postgres cluster)
+  Each shard group: 1 primary + 2 read replicas
+  Routing: shard = consistent_hash(video_id) % 16
+  Router layer (Vitess or PgBouncer + routing middleware) hides shard topology from services
+
+Read Replica Routing:
+  Video detail page:       Read from replica (eventual consistency OK; metadata stable)
+  Creator Studio update:   Write to primary → read-your-own-writes (sticky session to primary)
+  Admin/moderation tools:  Always read from primary (strong consistency required)
+  Replica lag SLO: < 100 ms (async replication; Postgres streaming replication)
+
+listing_calendar equivalent (video_streams table):
+  Sharded same as videos (by video_id)
+  Archive strategy:
+    Videos older than 2 years with < 1,000 views/month → move to cold shard (Postgres on cheaper storage)
+    Metadata kept; streams pointer updated to cold shard → transparent to API
+
+Comments Table:
+  Volume: 500M comments/day → cannot co-locate with video metadata
+  Separate Cassandra cluster: partition_key = video_id, clustering_key = comment_id DESC
+  Cassandra chosen for: high write throughput, infinite horizontal scale, time-range queries per video
+  Top comments: pre-computed and cached in Redis (refreshed every 5 min)
+```
+
+---
+
+## 13. Multi-Region & Disaster Recovery (Staff-Level)
+
+### 13.1 Regional Topology
+
+```
+Regions: US-EAST-1 (primary), EU-WEST-1, AP-SOUTHEAST-1, IN-SOUTH-1
+
+Service distribution:
+  Upload Service:       Active in all regions → uploads land in nearest region's S3
+                        Cross-region S3 replication → global processing fleet picks up job
+  Video Processing:     Central fleet in US-EAST-1 (cost + GPU availability)
+                        Regional processing for latency-sensitive live streams
+  Streaming CDN:        Fully distributed — all 200+ PoPs globally serve from edge
+  Metadata DB:          Primary in US-EAST-1; async replicas in EU + APAC
+                        Read replicas serve local reads (<10 ms vs ~150 ms cross-continent)
+  Recommendation:       Pre-computed results stored in regional Redis clusters
+                        Replication: US primary → EU + APAC via Kafka geo-replication
+  Search (ES):          Per-region ES clusters; index synced from US primary via Kafka
+```
+
+### 13.2 Active-Active vs. Active-Passive
+
+```
+Streaming (read path):   Active-Active — every region serves content independently
+                          No coordination needed; CDN is stateless
+
+Upload (write path):     Active-Active with regional affinity
+                          Upload → nearest region S3 → processing job queued
+                          video_id generated by Snowflake (machine_id encodes region)
+                          No cross-region write coordination for uploads
+
+Metadata writes:         Active-Passive (US-EAST-1 is primary)
+                          Reason: avoid split-brain on video status (PUBLISHED/REMOVED)
+                          EU/APAC creators accept ~150 ms extra write latency
+                          Alternative: CRDTs for non-critical fields (like_count)
+
+Booking-equivalent (reservations → video publish state):
+  Video publish is a one-way idempotent transition (PROCESSING → PUBLISHED)
+  Idempotency key = video_id → safe to retry across regions
+```
+
+### 13.3 Failure Modes & Recovery
+
+```
+Scenario 1: Primary DB (US-EAST-1) fails
+  Detection: Health check fails → PagerDuty alert in < 30 sec
+  Failover:  Promote EU-WEST-1 read replica to primary (automated, RDS Multi-AZ: <60 sec)
+  Impact:    Uploads queue in regional S3; processing pauses; streaming unaffected
+  RPO:       < 5 sec (async replication lag target)
+  RTO:       < 2 min for metadata writes
+
+Scenario 2: Processing pipeline outage
+  Videos queue in S3 / SQS; no data loss
+  Backlog processed when pipeline recovers (priority queue drains P0 first)
+  Creator shown "Processing taking longer than expected" after 10-min SLA breach
+
+Scenario 3: CDN PoP failure (single region)
+  DNS-based failover: Anycast routing moves traffic to nearest healthy PoP
+  CDN provider SLA: <30 sec PoP-level failover
+  Impact: Viewers in affected region see slightly higher latency (cache miss → origin)
+
+Scenario 4: Full region loss (US-EAST-1)
+  Streaming: CDN serves from edge; fully resilient — no origin hit needed for cached content
+  Uploads: DNS failover to EU-WEST-1 upload endpoint
+  Processing: EU processing fleet activates; uses S3 cross-region replication as input
+  Metadata: EU replica promoted; ~5 sec of writes potentially lost (RPO)
+  RTO:  <15 min for full upload+processing path restoration
+  RPO:  <5 sec for metadata; 0 for streaming (CDN stateless)
+
+RTO / RPO Summary:
+  | Path              | RTO        | RPO       |
+  |---                |---         |---        |
+  | Streaming (CDN)   | ~0 sec     | 0 sec     |
+  | Uploads           | < 2 min    | 0 (queue) |
+  | Video processing  | < 5 min    | 0 (queue) |
+  | Metadata reads    | < 1 min    | < 5 sec   |
+  | Metadata writes   | < 2 min    | < 5 sec   |
+```
+
+### 13.4 Data Durability
+
+```
+Raw video S3:      Replication factor 3 within region + Cross-region replication
+Processed video:   Same as raw + CDN acts as additional distributed cache
+Metadata DB:       WAL-based replication; PITR backup retained 30 days
+Kafka events:      Retention 7 days; replayable for re-indexing or audit
+Checksums:         S3 ETag (MD5) verified on every multipart upload complete
+```
+
+---
+
+## 14. Future Enhancements
 - **YouTube Shorts** — separate vertical video feed optimized for mobile (< 60 sec, TikTok-style FYP).
 - **8K / 360° / VR streaming** — requires specialized encoding and player.
 - **AI video chapters** — auto-detect scene changes → generate chapter titles from transcript.

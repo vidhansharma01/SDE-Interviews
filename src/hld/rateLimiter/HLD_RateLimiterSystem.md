@@ -17,14 +17,14 @@
 - Rate limiter must work in a **distributed** environment (multiple servers behind a load balancer).
 
 ### 1.2 Non-Functional Requirements
-| Property | Target |
-|---|---|
-| **Latency overhead** | < 5 ms per request (rate limiter check must be fast) |
-| **Availability** | 99.99% — rate limiter failure should fail open (not block all traffic) |
-| **Accuracy** | Allow at most X% burst above limit (< 1% overage acceptable) |
-| **Throughput** | Handle 1M+ requests/sec across all clients |
-| **Scalability** | Horizontally scalable; no single point of failure |
-| **Consistency** | Near-real-time across distributed nodes (eventual consistency acceptable) |
+| Property             | Target                                                                    |
+| -------------------- | ------------------------------------------------------------------------- |
+| **Latency overhead** | < 5 ms per request (rate limiter check must be fast)                      |
+| **Availability**     | 99.99% — rate limiter failure should fail open (not block all traffic)    |
+| **Accuracy**         | Allow at most X% burst above limit (< 1% overage acceptable)              |
+| **Throughput**       | Handle 1M+ requests/sec across all clients                                |
+| **Scalability**      | Horizontally scalable; no single point of failure                         |
+| **Consistency**      | Near-real-time across distributed nodes (eventual consistency acceptable) |
 
 ### 1.3 Out of Scope
 - Circuit breaker / retry logic (client responsibility)
@@ -35,14 +35,129 @@
 
 ## 2. Capacity Estimation
 
+### Assumptions
+
+| Parameter                     | Value                             |
+| ----------------------------- | --------------------------------- |
+| Total users                   | 100M                              |
+| Daily Active Users (DAU)      | 10M                               |
+| Avg requests per user per day | 100                               |
+| Peak traffic multiplier       | 5×                                |
+| Rate limit window             | 1 second (sliding / token bucket) |
+| Services being rate limited   | 50 microservices                  |
+
+### 2.1 Traffic Estimation
+
 ```
-Total API requests        = 1 billion/day → ~12,000 req/sec avg, ~1M req/sec peak
-Clients (users/API keys)  = 100 million
-Rate limit rules          = ~500 distinct rules (endpoint × client tier combinations)
-Storage per client        = ~100 bytes (counters + timestamps)
-Total counter storage     = 100M × 100B = ~10 GB (fits comfortably in Redis)
-Redis ops/sec             = 1M req/sec → 1M Redis calls/sec (1 INCR per request)
+Total requests/day  = 10M users × 100 req = 1B requests/day
+
+Avg RPS             = 1B / 86,400 ≈ 11,600 RPS
+
+Peak RPS            = 11,600 × 5 ≈ 60,000 RPS (60K RPS)
 ```
+
+Each inbound request requires at least one rate limiter check, so the rate limiter itself must handle **60K ops/sec** at peak.
+
+### 2.2 Storage Estimation
+
+**Sliding Window Counter** (most common in prod):
+```
+Per-user entry:
+  user_id       : 8 bytes
+  counter       : 4 bytes
+  window_start  : 8 bytes  (epoch ms)
+  TTL metadata  : 4 bytes
+  ─────────────────────────
+  Total         : ~24 bytes per user
+
+Storage for all active users:
+  = 10M users × 24 bytes = 240 MB  (fits in a single Redis node)
+
+With 50 services (per-service limits):
+  = 240 MB × 50 = 12 GB
+  → Redis cluster of 3 nodes × 8 GB RAM handles this with headroom.
+```
+
+**Token Bucket** (if storing tokens + last refill time):
+```
+Per-user entry:
+  user_id        : 8 bytes
+  tokens         : 4 bytes  (float)
+  last_refill_ts : 8 bytes
+  ─────────────────────────
+  Total          : ~20 bytes per user
+
+Storage          : ~200 MB for 10M users
+```
+
+### 2.3 Redis Operation Throughput
+
+```
+Redis capacity (single node)     : ~100K–200K ops/sec
+Ops per rate-limit check         : 2–3  (GET + INCR + EXPIRE, or 1 Lua round-trip)
+
+Total Redis ops at peak          = 60K req/s × 3 = 180K ops/sec
+
+→ 1 node is borderline.
+  Use a cluster of 3–5 sharded nodes to stay safely under capacity and allow failover.
+
+For Lua scripts (atomic sliding window):
+  Still 1 round-trip per request — Redis handles this well due to single-threaded atomicity.
+```
+
+### 2.4 Network Bandwidth
+
+```
+Request metadata per check:
+  user_id + service_id + timestamp ≈ 100 bytes
+
+Inbound bandwidth = 60K RPS × 100 bytes = 6 MB/s  ✅  (negligible)
+Outbound (allow / deny response)          ≈ same order
+
+No bandwidth concerns.
+```
+
+### 2.5 Latency Budget
+
+Rate limiting is in the **hot path** — overhead must be sub-millisecond.
+
+```
+Redis RTT (same DC, local network) : ~0.5 ms
+Lua script execution overhead       : ~0.1 ms
+─────────────────────────────────────────────
+Total rate limiter overhead         :  < 1 ms  ✅
+```
+
+> Use connection pooling (e.g., Lettuce async client in Spring) to avoid TCP handshake overhead per request.
+
+### 2.6 Failure & Replication
+
+| Concern                      | Solution                                               |
+| ---------------------------- | ------------------------------------------------------ |
+| Redis node failure           | Redis Sentinel or Cluster with 3 replicas              |
+| Split-brain / stale counters | Accept slight over-counting (fail open) or use Redlock |
+| Cold start / cache miss      | Initialize counter to 0 on first access with TTL       |
+| Data loss on restart         | RDB snapshot every 60s — counters are ephemeral anyway |
+
+> In most prod systems, **fail open** (allow request if rate limiter is down) is preferred over fail closed to avoid cascading outages.
+
+### 2.7 Summary
+
+| Metric                     | Value                      |
+| -------------------------- | -------------------------- |
+| Peak RPS to handle         | ~60,000 RPS                |
+| Redis ops/sec needed       | ~180,000 ops/sec           |
+| Redis nodes required       | 3–5 (sharded cluster)      |
+| Memory per service         | ~240 MB (10M active users) |
+| Total memory (50 services) | ~12 GB                     |
+| Network bandwidth          | ~6 MB/s (negligible)       |
+| P99 latency overhead       | < 1 ms                     |
+
+**Key Design Callouts:**
+- **Shard by `user_id`** across Redis nodes — consistent hashing avoids hotspots.
+- **Local in-process cache** (Guava/Caffeine) for a first-pass check before hitting Redis — cuts Redis load by ~70% for well-behaved clients.
+- **Sliding window + Lua** is the sweet spot: atomic, no race conditions, single round-trip.
+- **Multi-region:** Accept eventual consistency with local Redis per region + async sync, or use gossip-based counters (CRDTs, Riak-style).
 
 ---
 
@@ -263,13 +378,13 @@ String buildRateLimitKey(HttpRequest request) {
 
 **Key dimensions for rate limiting:**
 
-| Dimension | Example Key | Use Case |
-|---|---|---|
-| Per User | `user:{userId}` | Authenticated API limits |
-| Per API Key | `api:{apiKey}` | Developer/business tier limits |
-| Per IP | `ip:{ipAddr}` | Unauthenticated / public endpoints |
-| Per Endpoint | `user:{userId}:endpoint:{path}` | Endpoint-specific limits |
-| Global | `global:{endpoint}` | Total traffic cap on an endpoint |
+| Dimension    | Example Key                     | Use Case                           |
+| ------------ | ------------------------------- | ---------------------------------- |
+| Per User     | `user:{userId}`                 | Authenticated API limits           |
+| Per API Key  | `api:{apiKey}`                  | Developer/business tier limits     |
+| Per IP       | `ip:{ipAddr}`                   | Unauthenticated / public endpoints |
+| Per Endpoint | `user:{userId}:endpoint:{path}` | Endpoint-specific limits           |
+| Global       | `global:{endpoint}`             | Total traffic cap on an endpoint   |
 
 ---
 
@@ -289,6 +404,37 @@ CREATE TABLE rate_limit_rules (
 ```
 
 **Rules cached locally** in each Rate Limiter Service instance (TTL: 60 sec). Changes propagate within 1 minute — acceptable for rule updates.
+
+```
+  ┌─────────────────────────┐
+  │     Incoming Request    │
+  └────────────┬────────────┘
+               │
+               ▼
+  ┌─────────────────────────┐
+  │  Rate Limiter Instance  │
+  └────────────┬────────────┘
+               │
+               ▼
+  ┌─────────────────────────────────────┐
+  │  Read rule from local memory cache  │  (TTL: 60 sec)
+  │  Cache MISS → fetch from MySQL      │
+  └────────────┬────────────────────────┘
+               │
+               ▼
+  ┌─────────────────────────┐
+  │  Check counters in Redis │  (Lua script — atomic)
+  └────────────┬────────────┘
+               │
+       ┌───────┴────────┐
+       ▼                ▼
+  ┌─────────┐      ┌──────────┐
+  │  ALLOW  │      │  REJECT  │
+  │  200 OK │      │  429 + Retry-After │
+  └─────────┘      └──────────┘
+```
+
+#### In Java, we use ConcurrentHashMap for local memory cache. 
 
 **Priority resolution (most specific wins):**
 ```
@@ -471,13 +617,13 @@ Retry-After:           47           (seconds until retry)
 
 ## 10. Failure Handling
 
-| Failure | Strategy |
-|---|---|
-| **Redis unreachable** | **Fail open** — allow all requests (rate limiter unavailable; don't block traffic) |
-| **Redis timeout** | Short timeout (< 2ms); fail open if exceeded |
-| **Redis partial failure (one node)** | Redis Cluster auto-routes to replica |
-| **Rate Limiter Service crash** | Load balancer routes to healthy nodes |
-| **Rule config DB down** | Serve stale rules from local cache |
+| Failure                              | Strategy                                                                           |
+| ------------------------------------ | ---------------------------------------------------------------------------------- |
+| **Redis unreachable**                | **Fail open** — allow all requests (rate limiter unavailable; don't block traffic) |
+| **Redis timeout**                    | Short timeout (< 2ms); fail open if exceeded                                       |
+| **Redis partial failure (one node)** | Redis Cluster auto-routes to replica                                               |
+| **Rate Limiter Service crash**       | Load balancer routes to healthy nodes                                              |
+| **Rule config DB down**              | Serve stale rules from local cache                                                 |
 
 > **Fail open vs Fail closed:**  
 > For rate limiters — **fail open** is preferred. It's better to let some excess traffic through than to block all legitimate traffic when the rate limiter has issues.
@@ -524,26 +670,26 @@ When NOT to use local cache:
 
 ## 12. Redis Data Structure Summary
 
-| Algorithm | Redis Structure | Memory Per Client |
-|---|---|---|
-| Token Bucket | HASH (tokens, last_refill) | ~50 bytes |
-| Fixed Window | STRING (counter) | ~20 bytes |
-| Sliding Window Log | ZSET (timestamps) | ~100B × req count |
-| Sliding Window Counter | 2× STRING (prev + curr count) | ~40 bytes |
+| Algorithm              | Redis Structure               | Memory Per Client |
+| ---------------------- | ----------------------------- | ----------------- |
+| Token Bucket           | HASH (tokens, last_refill)    | ~50 bytes         |
+| Fixed Window           | STRING (counter)              | ~20 bytes         |
+| Sliding Window Log     | ZSET (timestamps)             | ~100B × req count |
+| Sliding Window Counter | 2× STRING (prev + curr count) | ~40 bytes         |
 
 ---
 
 ## 13. Key Design Decisions & Trade-offs
 
-| Decision | Choice | Trade-off |
-|---|---|---|
-| **Algorithm** | Sliding Window Counter | Best accuracy/memory balance; < 1% error |
-| **Storage** | Redis Cluster | Fast atomic ops; single source of truth |
-| **Atomicity** | Lua scripts | No race conditions; single round trip |
-| **Failure mode** | Fail open | Traffic not blocked; risk of slight over-limit |
-| **Rule config** | Local cache (60s TTL) | Low latency; rules update within 1 min |
-| **Client key** | API key > userId > IP | Most granular identification first |
-| **Distributed sync** | Centralized Redis | Consistent limits; Redis is the bottleneck |
+| Decision             | Choice                 | Trade-off                                      |
+| -------------------- | ---------------------- | ---------------------------------------------- |
+| **Algorithm**        | Sliding Window Counter | Best accuracy/memory balance; < 1% error       |
+| **Storage**          | Redis Cluster          | Fast atomic ops; single source of truth        |
+| **Atomicity**        | Lua scripts            | No race conditions; single round trip          |
+| **Failure mode**     | Fail open              | Traffic not blocked; risk of slight over-limit |
+| **Rule config**      | Local cache (60s TTL)  | Low latency; rules update within 1 min         |
+| **Client key**       | API key > userId > IP  | Most granular identification first             |
+| **Distributed sync** | Centralized Redis      | Consistent limits; Redis is the bottleneck     |
 
 ---
 
@@ -572,13 +718,13 @@ Recommended: API Gateway for external traffic + Sidecar for inter-service limits
 
 ## 15. Monitoring & Observability
 
-| Signal | Metric / Alert |
-|---|---|
-| **Throttle rate** | % of requests returning 429; spike = abuse or misconfigured limit |
-| **Redis latency** | P99 response time for INCR ops; alert if > 3ms |
-| **Rule cache miss rate** | Frequency of fallback to DB for rule lookup |
-| **Client blacklist requests** | Clients consistently at 100% throttle → candidate for blocking |
-| **False positive rate** | Legitimate requests throttled — monitor via client complaints |
+| Signal                        | Metric / Alert                                                    |
+| ----------------------------- | ----------------------------------------------------------------- |
+| **Throttle rate**             | % of requests returning 429; spike = abuse or misconfigured limit |
+| **Redis latency**             | P99 response time for INCR ops; alert if > 3ms                    |
+| **Rule cache miss rate**      | Frequency of fallback to DB for rule lookup                       |
+| **Client blacklist requests** | Clients consistently at 100% throttle → candidate for blocking    |
+| **False positive rate**       | Legitimate requests throttled — monitor via client complaints     |
 
 ---
 
