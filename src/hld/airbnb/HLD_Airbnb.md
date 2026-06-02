@@ -138,50 +138,134 @@ Important invariants:
 
 ## 6.1 Search APIs
 ```http
-GET /v1/search?lat=..&lng=..&checkIn=2026-07-10&checkOut=2026-07-14&guests=3&minPrice=100&maxPrice=350&amenities=wifi,kitchen&pageToken=...
+GET Search Listings
+/v1/listings/search?location=Bangalore&
+    checkIn=2026-07-10&
+    checkOut=2026-07-15&
+    guests=2&
+    minPrice=1000&
+    maxPrice=5000&
+    amenities=wifi,pool&
+    page=1&
+    pageSize=20
+
+    Response:-
+    {
+  "total": 12345,
+  "page": 1,
+  "pageSize": 20,
+  "listings": [
+    {
+      "listingId": "L123",
+      "title": "Luxury Apartment",
+      "pricePerNight": 3500,
+      "rating": 4.8,
+      "thumbnailUrl": "https://cdn.airbnb.com/..."
+    }
+  ]
+}
 ```
 
 ```http
-GET /v1/listings/{listingId}
-```
+GET Listing Details
+/v1/listings/{listingId}
 
-```http
-POST /v1/listings/{listingId}/quote
+Response:-
 {
-  "checkIn": "2026-07-10",
-  "checkOut": "2026-07-14",
-  "guests": 3,
-  "currency": "USD"
+  "listingId": "L123",
+  "hostId": "H100",
+  "title": "Luxury Apartment",
+  "description": "2BHK near airport",
+  "pricePerNight": 3500,
+  "amenities": [
+    "wifi",
+    "pool",
+    "parking"
+  ],
+  "images": [
+    "https://cdn.airbnb.com/img1.jpg"
+  ]
+}
+```
+
+```http
+GET Check availability 
+/v1/listings/L123/availability?
+checkIn=2026-07-10&
+checkOut=2026-07-15
+
+Response:-
+{
+  "available": true,
+  "price": 17500,
+  "currency": "INR"
+}
+```
+
+```http
+POST Create Listings
+/v1/listings
+{
+  "title": "Luxury Apartment",
+  "description": "Near airport",
+  "address": "Whitefield",
+  "pricePerNight": 3500,
+  "amenities": [
+    "wifi",
+    "parking"
+  ]
+}
+
+Response:=
+{
+  "listingId": "L123"
 }
 ```
 
 ## 6.2 Booking APIs
 ```http
-POST /v1/reservations/hold
+POST /v1/bookings
 Idempotency-Key: a4e3...
 {
   "listingId": "lst_123",
   "checkIn": "2026-07-10",
   "checkOut": "2026-07-14",
-  "guestId": "usr_9",
-  "quoteId": "q_abc"
+  "guestId": "usr_9"
+}
+
+Response:-
+{
+  "bookingId": "B123",
+  "status": "PENDING_PAYMENT"
 }
 ```
 
 ```http
-POST /v1/reservations/{holdId}/confirm
+POST /v1/bookings/{bookingId}/confirm
 Idempotency-Key: b9c2...
 {
   "paymentMethodId": "pm_22",
   "billingAddressId": "addr_7"
 }
+
+Response:-
+{
+  "bookingId": "B123",
+  "status": "CONFIRMED"
+}
 ```
 
 ```http
-POST /v1/reservations/{reservationId}/cancel
+POST /v1/bookings/{bookingId}/cancel
 {
   "initiator": "GUEST",
   "reasonCode": "CHANGE_OF_PLANS"
+}
+
+Response:-
+{
+  "bookingId": "B123",
+  "status": "CANCELLED"
 }
 ```
 
@@ -264,6 +348,53 @@ Responsibilities:
 Data:
 - Strongly consistent relational store for listing source-of-truth.
 - Media metadata in DB, photos in object storage + CDN.
+```text
+Get Listing Details FLOW:- [READ PATH]
+Client
+   |
+   v
+Listing Service
+   |
+   v
+Redis
+   |
+Cache Hit?
+   |
+  Yes -----> Return
+   |
+  No
+   |
+   v
+Postgres
+   |
+   v
+Cache Result
+   |
+   v
+Return
+
+Host ADD/Update listing:- [WRITE PATH]
+
+Host
+  |
+  v
+Listing Service
+  |
+  v
+Postgres
+
+  |
+  v
+Kafka Event
+      |
+      v
+Indexer Service
+      |
+      v
+ElasticSearch
+
+Summary:: The Listing Service owns listing metadata and acts as the source of truth. Listing updates are persisted in PostgreSQL and published as events to Kafka. A separate Indexer Service updates OpenSearch asynchronously. Listing images are stored in S3 and served via CDN. Redis caches hot listings to achieve sub-100ms read latency. Search and booking concerns are intentionally separated from the Listing Service so each can scale independently according to its workload characteristics.
+```
 
 ## 8.2 Search Orchestrator
 Responsibilities:
@@ -281,6 +412,39 @@ Ranking factors (example):
 - host quality score
 - price competitiveness
 - personalization score
+
+```text
+Search
+   |
+   v
+ElasticSearch
+
+   |
+Top 1000
+
+   |
+   v
+
+Availability Service
+
+   |
+   v
+
+Top 100 Available
+    |
+    v
+  Ranking [return results]
+
+>> Ranking Score = Relevance + Rating
++ Conversion Rate
++ Booking Probability
++ Host Quality
+
+>> Caching Strategy: cache popular location like Goa, Darjeeling etc.
+
+Summary: The Search Service is built on OpenSearch and stores denormalized listing documents optimized for geo-search, filtering, and ranking. Listing changes are propagated asynchronously via Kafka and an indexing pipeline. Search results are cached in Redis and filtered through the Availability Service before ranking. The service is eventually consistent, horizontally scalable, and designed to handle 60K–100K QPS with sub-300 ms latency. The key architectural decision is to separate search, availability, and booking so each can scale independently and use the consistency model appropriate to its workload.
+
+```
 
 ## 8.3 Availability/Calendar Service
 Responsibilities:
