@@ -471,6 +471,8 @@ Responsibilities:
 
 Returns a signed `quoteId` with short TTL (for example 15 minutes).
 
+>> The quoteId is cache with TTL because if the users checkout then they should not get increased prices.
+
 ## 8.5 Booking Service
 Responsibilities:
 - Create temporary hold.

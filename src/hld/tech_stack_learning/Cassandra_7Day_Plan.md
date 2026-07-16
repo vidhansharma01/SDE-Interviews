@@ -145,7 +145,20 @@ AND durable_writes = true;
 # 📅 Day 2 — Data Modeling (Most Critical Skill)
 
 > ⚠️ **This is the most important day.** Bad data modeling = bad performance in Cassandra. Unlike SQL, you design your tables **around your queries**, not around your entities.
+```
+Docker command to download Cassandra= docker run --name cassandra -p 9042:9042 -d cassandra:5.0**
 
+Start Cassandra= docker exec -it cassandra cqlsh
+
+url= jdbc:cassandra://localhost:9042?localdatacenter=datacenter1
+
+CREATE KEYSPACE ecommerce
+WITH replication = {
+  'class': 'NetworkTopologyStrategy',
+  'datacenter1': 3   -- 3 replicas in DC1
+}
+AND durable_writes = true;
+```
 ## 2.1 The Golden Rule: Query-First Design
 
 In SQL: Design normalized tables → write any query you want.
