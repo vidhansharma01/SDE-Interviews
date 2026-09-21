@@ -30,7 +30,7 @@ public class UrlEventPublisher {
 
     // Virtual thread executor — lightweight, one thread per task, Java 21+
     // Falls back to cached thread pool for older Java versions
-    private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
     public void register(UrlEventListener listener) {
         listeners.add(listener);

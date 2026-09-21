@@ -262,7 +262,7 @@ public class UrlShortenerServiceImpl implements UrlShortenerService {
         int h1 = code.hashCode();
         int h2 = code.chars().reduce(31, (a, c) -> a * 31 + c);
         for (int i = 0; i < bloomHashFunctions; i++) {
-            bloomFilter.set(Math.abs((h1 + (long)i * h2) % bloomBits));
+            bloomFilter.set((int)(Math.abs((h1 + (long)i * h2) % bloomBits)));
         }
     }
 
@@ -270,7 +270,7 @@ public class UrlShortenerServiceImpl implements UrlShortenerService {
         int h1 = code.hashCode();
         int h2 = code.chars().reduce(31, (a, c) -> a * 31 + c);
         for (int i = 0; i < bloomHashFunctions; i++) {
-            if (!bloomFilter.get(Math.abs((h1 + (long)i * h2) % bloomBits))) return false;
+            if (!bloomFilter.get((int)Math.abs((h1 + (long)i * h2) % bloomBits))) return false;
         }
         return true;
     }
